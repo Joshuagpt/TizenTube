@@ -30,6 +30,14 @@ const DEFAULT_INIT_POLL_INTERVAL_MS = 500;
 // top of the command that just ran.
 const CAPTIONS_SETTLE_DELAY_MS = 1000;
 
+// How long after a video starts the auto-apply schedule waits before
+// forcing the saved translation language on. Right at video start is
+// the least reliable moment to query or act on player state — this is
+// also reused as the delay before establishing the "are captions on"
+// baseline for a new video, since that timing is already proven
+// reliable by the schedule itself.
+const AUTO_APPLY_DELAY_MS = 3000;
+
 let isInternalApply = false;
 
 function getCurrentPlayer() {
@@ -221,6 +229,12 @@ class SubtitlePersistenceHandler {
     // ever reacts to a genuine off → on transition, whichever video
     // it happens to occur on.
     #captionsWereOn = false;
+    // Whether #captionsWereOn has been established for #lastVideoId
+    // yet via the delayed baseline check below. Until it has, we
+    // don't attempt any transition detection — same as the auto-apply
+    // schedule itself not acting until AUTO_APPLY_DELAY_MS either.
+    #captionsBaselineReady = false;
+    #captionsBaselineTimerId = null;
 
     constructor() {
         this.init();
@@ -317,15 +331,15 @@ class SubtitlePersistenceHandler {
         }
 
         // getOption() may not reflect the change perfectly
-        // synchronously right after the command runs. One retry
-        // after the same settle delay catches that without polling
-        // indefinitely.
-        if (attempt === 0) {
+        // synchronously right after the command runs. A couple of
+        // retries at the same settle delay catch that without
+        // polling indefinitely.
+        if (attempt < 2) {
             setTimeout(() => {
                 this.#correctOnClosedToOpenTransition(
                     videoId,
                     wasOn,
-                    1
+                    attempt + 1
                 );
             }, CAPTIONS_SETTLE_DELAY_MS);
 
@@ -381,7 +395,7 @@ class SubtitlePersistenceHandler {
 
             applyPreferredLanguage();
             this.#captionsWereOn = true;
-        }, 3000);
+        }, AUTO_APPLY_DELAY_MS);
 
         this.#timers.push(timerId);
     }
@@ -397,7 +411,27 @@ class SubtitlePersistenceHandler {
 
         this.#lastVideoId = videoId;
         this.#scheduledVideoId = null;
-        this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
+        this.#captionsWereOn = false;
+        this.#captionsBaselineReady = false;
+
+        // Right at a video transition is the least reliable moment to
+        // query the player — it can still be reflecting the previous
+        // video's state. Wait the same delay already proven reliable
+        // for the auto-apply schedule before establishing the real
+        // baseline; until then, transition detection is simply held
+        // off (see the resolveCommand patch below).
+        if (this.#captionsBaselineTimerId !== null) {
+            clearTimeout(this.#captionsBaselineTimerId);
+        }
+
+        this.#captionsBaselineTimerId = setTimeout(() => {
+            if (this.#getVideoId() !== videoId) {
+                return;
+            }
+
+            this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
+            this.#captionsBaselineReady = true;
+        }, AUTO_APPLY_DELAY_MS);
 
         this.#clearTimers();
     }
@@ -499,6 +533,7 @@ class SubtitlePersistenceHandler {
                 this.#scheduledVideoId = null;
                 this.#overriddenVideoId = null;
                 this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
+                this.#captionsBaselineReady = true;
                 this.#clearTimers();
 
                 if (
@@ -614,11 +649,16 @@ class SubtitlePersistenceHandler {
                             // finally reopening captions on a video
                             // whose closed state carried over from the
                             // last one, is irrelevant — only the
-                            // transition itself matters.
-                            self.#correctOnClosedToOpenTransition(
-                                videoId,
-                                self.#captionsWereOn
-                            );
+                            // transition itself matters. Skip this
+                            // entirely until the baseline for this
+                            // video is established — same timing the
+                            // auto-apply schedule already relies on.
+                            if (self.#captionsBaselineReady) {
+                                self.#correctOnClosedToOpenTransition(
+                                    videoId,
+                                    self.#captionsWereOn
+                                );
+                            }
                         }
                     }
                 }
