@@ -628,37 +628,44 @@ class SubtitlePersistenceHandler {
                         const videoId = self.#getVideoId();
 
                         if (videoId) {
-                            // Unchanged from the original design:
-                            // respect this for the rest of THIS video,
-                            // don't let the pending auto-apply timer
-                            // fight it. Whether this "off" came from a
-                            // real click here or from YouTube TV
-                            // carrying over the previous video's state
-                            // isn't something we try to tell apart —
-                            // that carrying-over is native behavior,
-                            // not ours to manage.
-                            self.#overriddenVideoId = videoId;
-                            self.#scheduledVideoId = null;
-                            self.#clearTimers();
-
-                            // Independently: if this specific command
-                            // just turned captions on after they were
-                            // off, apply the saved translation language
-                            // on top of it. Whether that's a fresh
-                            // click on this same video, or the user
-                            // finally reopening captions on a video
-                            // whose closed state carried over from the
-                            // last one, is irrelevant — only the
-                            // transition itself matters. Skip this
-                            // entirely until the baseline for this
-                            // video is established — same timing the
-                            // auto-apply schedule already relies on.
+                            // Only treat a non-translation command as a
+                            // genuine user override AFTER the baseline
+                            // for this video has been established
+                            // (~AUTO_APPLY_DELAY_MS after video start).
+                            // Non-translation commands that arrive
+                            // earlier are treated as YouTube TV's own
+                            // automatic track selection on video load
+                            // (native state carry-over), and are
+                            // deliberately ignored so the pending
+                            // auto-apply timer can still force the
+                            // remembered translation language.
                             if (self.#captionsBaselineReady) {
+                                // User manually selected a non-translated
+                                // track or turned captions off while
+                                // watching this video — respect that for
+                                // the rest of THIS video only.
+                                self.#overriddenVideoId = videoId;
+                                self.#scheduledVideoId = null;
+                                self.#clearTimers();
+
+                                // Independently: if this specific command
+                                // just turned captions on after they were
+                                // off, apply the saved translation language
+                                // on top of it. Whether that's a fresh
+                                // click on this same video, or the user
+                                // finally reopening captions on a video
+                                // whose closed state carried over from the
+                                // last one, is irrelevant — only the
+                                // transition itself matters.
                                 self.#correctOnClosedToOpenTransition(
                                     videoId,
                                     self.#captionsWereOn
                                 );
                             }
+                            // else: baseline not ready yet → ignore this
+                            // non-translation command (system auto-select).
+                            // Do NOT set #overriddenVideoId and do NOT
+                            // clear the auto-apply timers.
                         }
                     }
                 }
