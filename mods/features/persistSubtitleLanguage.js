@@ -214,6 +214,13 @@ class SubtitlePersistenceHandler {
     // so the default language resumes applying with no extra reset
     // logic needed.
     #overriddenVideoId = null;
+    // Best-known "are captions currently on" state, refreshed from the
+    // actual player whenever we check. Deliberately not scoped to a
+    // video id: closed-state carrying over between videos is YouTube
+    // TV's own native behavior, not something we manage — this only
+    // ever reacts to a genuine off → on transition, whichever video
+    // it happens to occur on.
+    #captionsWereOn = false;
 
     constructor() {
         this.init();
@@ -268,37 +275,43 @@ class SubtitlePersistenceHandler {
         }
     }
 
-    // After a non-translation subtitle command executes (closing
-    // captions, or picking a native/non-translated track), check
-    // whether it actually left captions on. If so, the user is asking
-    // to see subtitles — right now, on some non-translated track — so
-    // redirect that to the saved translation language instead. If it
-    // left captions off, there's nothing to correct: an off result is
-    // always accepted, whatever produced it.
-    #correctToPreferredLanguageIfCaptionsAreOn(videoId, attempt = 0) {
+    // Detects a genuine closed → open transition and, if this command
+    // caused one, applies the saved translation language on top of
+    // whatever native track it landed on. Takes no interest in which
+    // video the "off" state came from — carrying it over from the
+    // previous video is YouTube TV's own native behavior; this only
+    // reacts to the transition itself, right now, on whichever video
+    // is currently playing.
+    #correctOnClosedToOpenTransition(videoId, wasOn, attempt = 0) {
         if (this.#getVideoId() !== videoId) {
-            // Video changed in the meantime; this check no longer
-            // applies to whatever is now playing.
+            // Video changed in the meantime; no longer relevant.
             return;
         }
 
-        if (this.#areCaptionsCurrentlyOn()) {
-            // Defer the actual correction rather than calling
-            // applyPreferredLanguage() here directly: this check runs
-            // synchronously inside the resolveCommand call that just
-            // turned captions on, and applyPreferredLanguage() calls
-            // back into that same (patched) resolveCommand. Firing it
-            // immediately would re-enter that call before it has even
-            // returned — and on slower TV hardware, before the player
-            // has even finished processing the command that just ran.
-            // Waiting CAPTIONS_SETTLE_DELAY_MS gives both room to settle.
-            setTimeout(() => {
-                if (this.#getVideoId() !== videoId) {
-                    return;
-                }
+        const isOnNow = this.#areCaptionsCurrentlyOn();
 
-                applyPreferredLanguage();
-            }, CAPTIONS_SETTLE_DELAY_MS);
+        if (isOnNow) {
+            this.#captionsWereOn = true;
+
+            if (!wasOn) {
+                // Defer the actual correction rather than calling
+                // applyPreferredLanguage() here directly: this runs
+                // synchronously inside the resolveCommand call that
+                // just turned captions on, and applyPreferredLanguage()
+                // calls back into that same (patched) resolveCommand.
+                // Firing it immediately would re-enter that call
+                // before it has even returned — and on slower TV
+                // hardware, before the player has even finished
+                // processing the command that just ran. Waiting
+                // CAPTIONS_SETTLE_DELAY_MS gives both room to settle.
+                setTimeout(() => {
+                    if (this.#getVideoId() !== videoId) {
+                        return;
+                    }
+
+                    applyPreferredLanguage();
+                }, CAPTIONS_SETTLE_DELAY_MS);
+            }
 
             return;
         }
@@ -309,12 +322,17 @@ class SubtitlePersistenceHandler {
         // indefinitely.
         if (attempt === 0) {
             setTimeout(() => {
-                this.#correctToPreferredLanguageIfCaptionsAreOn(
+                this.#correctOnClosedToOpenTransition(
                     videoId,
+                    wasOn,
                     1
                 );
             }, CAPTIONS_SETTLE_DELAY_MS);
+
+            return;
         }
+
+        this.#captionsWereOn = false;
     }
 
     #clearTimers() {
@@ -362,6 +380,7 @@ class SubtitlePersistenceHandler {
             }
 
             applyPreferredLanguage();
+            this.#captionsWereOn = true;
         }, 3000);
 
         this.#timers.push(timerId);
@@ -378,6 +397,7 @@ class SubtitlePersistenceHandler {
 
         this.#lastVideoId = videoId;
         this.#scheduledVideoId = null;
+        this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
 
         this.#clearTimers();
     }
@@ -478,6 +498,7 @@ class SubtitlePersistenceHandler {
 
                 this.#scheduledVideoId = null;
                 this.#overriddenVideoId = null;
+                this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
                 this.#clearTimers();
 
                 if (
@@ -572,26 +593,31 @@ class SubtitlePersistenceHandler {
                         const videoId = self.#getVideoId();
 
                         if (videoId) {
-                            // Whatever produced this command — YouTube
-                            // replaying the previous video's state, or
-                            // the user picking something from the
-                            // subtitle menu — stop the pending
-                            // auto-apply for this video so it doesn't
-                            // fight whatever just happened. An off
-                            // result is accepted as-is; a saved
-                            // translation is never touched here.
+                            // Unchanged from the original design:
+                            // respect this for the rest of THIS video,
+                            // don't let the pending auto-apply timer
+                            // fight it. Whether this "off" came from a
+                            // real click here or from YouTube TV
+                            // carrying over the previous video's state
+                            // isn't something we try to tell apart —
+                            // that carrying-over is native behavior,
+                            // not ours to manage.
                             self.#overriddenVideoId = videoId;
                             self.#scheduledVideoId = null;
                             self.#clearTimers();
 
-                            // But if this actually left captions ON —
-                            // whether that's the user turning captions
-                            // back on, or picking a native/non-translated
-                            // track — redirect to the saved translation
-                            // language instead of whatever native track
-                            // it landed on.
-                            self.#correctToPreferredLanguageIfCaptionsAreOn(
-                                videoId
+                            // Independently: if this specific command
+                            // just turned captions on after they were
+                            // off, apply the saved translation language
+                            // on top of it. Whether that's a fresh
+                            // click on this same video, or the user
+                            // finally reopening captions on a video
+                            // whose closed state carried over from the
+                            // last one, is irrelevant — only the
+                            // transition itself matters.
+                            self.#correctOnClosedToOpenTransition(
+                                videoId,
+                                self.#captionsWereOn
                             );
                         }
                     }
