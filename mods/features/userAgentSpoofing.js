@@ -63,6 +63,7 @@ if (document.querySelector('.content-container') && window.h5vcc && window.h5vcc
     if (ua) {
         window.h5vcc.tizentube.SetUserAgent(ua);
         location.reload();
+        return;   // ← 补这一行
     }
 
     const randomProfile = deviceProfiles[Math.floor(Math.random() * deviceProfiles.length)];
