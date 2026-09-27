@@ -13,76 +13,15 @@ const CONFIG_KEYS = {
     NAME: 'preferredSubtitleLanguageName',
 };
 
-// One-time flag: once the app has run the auto-default logic below a
-// single time (successfully or not), it never runs it again, so a user
-// who later turns persistence off — or picks a different language — is
-// never overridden by this again.
 const DEFAULT_INIT_KEY = 'subtitleLanguageDefaultInitialized';
-const DEFAULT_INIT_MAX_ATTEMPTS = 40; // ~20s at 500ms intervals
+const DEFAULT_INIT_MAX_ATTEMPTS = 40;
 const DEFAULT_INIT_POLL_INTERVAL_MS = 500;
 
-// After a non-translation subtitle command runs, the resulting captions
-// state may not be reflected by getOption() perfectly synchronously —
-// and on slower TV hardware, the player itself may still be mid-way
-// through processing that command. This same delay is used both to
-// retry the state check, and to space out the corrective command sent
-// afterward, so we're never querying or writing to the player right on
-// top of the command that just ran.
 const CAPTIONS_SETTLE_DELAY_MS = 1000;
 
-// How long after a video starts the auto-apply schedule waits before
-// forcing the saved translation language on. Right at video start is
-// the least reliable moment to query or act on player state — this is
-// also reused as the delay before establishing the "are captions on"
-// baseline for a new video, since that timing is already proven
-// reliable by the schedule itself.
 const AUTO_APPLY_DELAY_MS = 3000;
 
 let isInternalApply = false;
-
-// TEMPORARY DEBUG HELPER — shows log lines in the top-left corner of the
-// screen, for testing on a TV with no console access. Safe to delete
-// once the getOption() investigation is done; it doesn't affect any
-// other behavior.
-function debugLog(message) {
-    try {
-        let el = document.getElementById(
-            'subtitle-persistence-debug-overlay'
-        );
-
-        if (!el) {
-            el = document.createElement('div');
-            el.id = 'subtitle-persistence-debug-overlay';
-            el.style.cssText = [
-                'position:fixed',
-                'top:0',
-                'left:0',
-                'z-index:999999',
-                'background:rgba(0,0,0,0.85)',
-                'color:#0f0',
-                'font-size:22px',
-                'font-family:monospace',
-                'padding:10px',
-                'max-width:92vw',
-                'max-height:60vh',
-                'overflow:hidden',
-                'white-space:pre-wrap',
-                'pointer-events:none',
-            ].join(';');
-            document.documentElement.appendChild(el);
-        }
-
-        const time = new Date().toTimeString().slice(0, 8);
-        const lines = [`[${time}] ${message}`, el.textContent]
-            .join('\n')
-            .split('\n')
-            .slice(0, 16);
-
-        el.textContent = lines.join('\n');
-    } catch (e) {
-        // Debug overlay itself must never throw.
-    }
-}
 
 function getCurrentPlayer() {
     try {
@@ -216,12 +155,6 @@ function resolveDeviceDefaultLanguage() {
     return guessLanguageFromNavigator();
 }
 
-// Runs at most once ever (gated by DEFAULT_INIT_KEY). On a fresh setup,
-// turns persistence on and seeds it with the device/region's language, the
-// same way it's inferred for the "add my local language" subtitle-menu
-// option elsewhere in this codebase. Deliberately never runs again after
-// that, so a later manual change to either the toggle or the language is
-// permanent and won't be reset back to this default.
 function initializeDefaultSubtitleLanguage(attempt = 0) {
     if (configRead(DEFAULT_INIT_KEY)) {
         return;
@@ -229,10 +162,6 @@ function initializeDefaultSubtitleLanguage(attempt = 0) {
 
     const lang = resolveDeviceDefaultLanguage();
 
-    // getUserCountryCode() depends on window.yt.config_.GL, which — like
-    // .HL used for UI language elsewhere — may not be populated yet this
-    // early in startup. Retry briefly before falling back permanently to
-    // whatever guessLanguageFromNavigator() can give us.
     if (!lang && attempt < DEFAULT_INIT_MAX_ATTEMPTS) {
         setTimeout(
             () => initializeDefaultSubtitleLanguage(attempt + 1),
@@ -248,8 +177,6 @@ function initializeDefaultSubtitleLanguage(attempt = 0) {
         configWrite(CONFIG_KEYS.NAME, lang.name);
     }
 
-    // Mark this done even on total failure to resolve a language, so we
-    // never keep retrying indefinitely on every app launch.
     configWrite(DEFAULT_INIT_KEY, true);
 }
 
@@ -259,24 +186,11 @@ class SubtitlePersistenceHandler {
     #scheduledVideoId = null;
     #timers = [];
     #isPatched = false;
-    // The video id the user manually overrode captions for (turned
-    // them off, or picked a non-translated track) while persistence
-    // was on. Scoped to a single video id on purpose: once the video
-    // changes, this is simply never equal to the new video id again,
-    // so the default language resumes applying with no extra reset
-    // logic needed.
+
     #overriddenVideoId = null;
-    // Best-known "are captions currently on" state, refreshed from the
-    // actual player whenever we check. Deliberately not scoped to a
-    // video id: closed-state carrying over between videos is YouTube
-    // TV's own native behavior, not something we manage — this only
-    // ever reacts to a genuine off → on transition, whichever video
-    // it happens to occur on.
+
     #captionsWereOn = false;
-    // Whether #captionsWereOn has been established for #lastVideoId
-    // yet via the delayed baseline check below. Until it has, we
-    // don't attempt any transition detection — same as the auto-apply
-    // schedule itself not acting until AUTO_APPLY_DELAY_MS either.
+
     #captionsBaselineReady = false;
     #captionsBaselineTimerId = null;
 
@@ -316,10 +230,6 @@ class SubtitlePersistenceHandler {
         }
     }
 
-    // Whether captions are actually showing something right now,
-    // regardless of what command led there. Off / no track selected
-    // comes back as an empty object from getOption, so we only count
-    // it as "on" when a real language code is present.
     #areCaptionsCurrentlyOn() {
         try {
             const track = this.#player?.getOption?.(
@@ -327,89 +237,37 @@ class SubtitlePersistenceHandler {
                 'track'
             );
 
-            debugLog('getOption track: ' + JSON.stringify(track));
-
             return !!(track && track.languageCode);
         } catch (e) {
-            debugLog('getOption threw: ' + e);
             return false;
         }
     }
 
-    // Detects a genuine closed → open transition and, if this command
-    // caused one, applies the saved translation language on top of
-    // whatever native track it landed on. Takes no interest in which
-    // video the "off" state came from — carrying it over from the
-    // previous video is YouTube TV's own native behavior; this only
-    // reacts to the transition itself, right now, on whichever video
-    // is currently playing.
     #correctOnClosedToOpenTransition(videoId, wasOn, attempt = 0) {
         if (this.#getVideoId() !== videoId) {
-            // Video changed in the meantime; no longer relevant.
+
             return;
         }
 
         const isOnNow = this.#areCaptionsCurrentlyOn();
 
-        debugLog(
-            `correct check attempt=${attempt} wasOn=${wasOn} isOnNow=${isOnNow}`
-        );
-
         if (isOnNow) {
             this.#captionsWereOn = true;
 
             if (!wasOn) {
-                debugLog('transition detected -> will apply translation');
 
-                // Defer the actual correction rather than calling
-                // applyPreferredLanguage() here directly: this runs
-                // synchronously inside the resolveCommand call that
-                // just turned captions on, and applyPreferredLanguage()
-                // calls back into that same (patched) resolveCommand.
-                // Firing it immediately would re-enter that call
-                // before it has even returned — and on slower TV
-                // hardware, before the player has even finished
-                // processing the command that just ran. Waiting
-                // CAPTIONS_SETTLE_DELAY_MS gives both room to settle.
                 setTimeout(() => {
                     if (this.#getVideoId() !== videoId) {
                         return;
                     }
 
-                    debugLog('applyPreferredLanguage() firing now');
                     applyPreferredLanguage();
-
-                    // Verification only — does not affect behavior.
-                    // Checks whether the corrective command actually
-                    // took effect, or was silently dropped/ignored by
-                    // the player.
-                    setTimeout(() => {
-                        if (this.#getVideoId() !== videoId) {
-                            return;
-                        }
-
-                        const track = this.#player?.getOption?.(
-                            'captions',
-                            'track'
-                        );
-
-                        debugLog(
-                            'post-apply check track: ' +
-                                JSON.stringify(track)
-                        );
-                    }, CAPTIONS_SETTLE_DELAY_MS);
                 }, CAPTIONS_SETTLE_DELAY_MS);
-            } else {
-                debugLog('already on before -> no correction');
             }
 
             return;
         }
 
-        // getOption() may not reflect the change perfectly
-        // synchronously right after the command runs. A couple of
-        // retries at the same settle delay catch that without
-        // polling indefinitely.
         if (attempt < 2) {
             setTimeout(() => {
                 this.#correctOnClosedToOpenTransition(
@@ -442,9 +300,6 @@ class SubtitlePersistenceHandler {
             return;
         }
 
-        // The user already chose something else for this specific
-        // video (see the resolveCommand wrapper below) — respect that
-        // for the rest of this video instead of fighting it.
         if (videoId === this.#overriddenVideoId) {
             return;
         }
@@ -469,29 +324,14 @@ class SubtitlePersistenceHandler {
                 return;
             }
 
-            debugLog('schedule: applying preferred language now');
             applyPreferredLanguage();
 
-            // Verify rather than assume: this fires at the exact same
-            // volatile just-after-video-start timing that's caused
-            // trouble elsewhere, so the command itself can silently
-            // fail to take effect here too. Blindly marking this true
-            // regardless of success previously poisoned later
-            // transition detection — a real closed → open action
-            // afterward would see a false "was already on" and skip
-            // correcting it. Only record what's actually true.
             setTimeout(() => {
                 if (this.#getVideoId() !== videoId) {
                     return;
                 }
 
-                const succeeded = this.#areCaptionsCurrentlyOn();
-
-                debugLog(
-                    'schedule: post-apply check succeeded=' + succeeded
-                );
-
-                this.#captionsWereOn = succeeded;
+                this.#captionsWereOn = this.#areCaptionsCurrentlyOn();
             }, CAPTIONS_SETTLE_DELAY_MS);
         }, AUTO_APPLY_DELAY_MS);
 
@@ -512,12 +352,6 @@ class SubtitlePersistenceHandler {
         this.#captionsWereOn = false;
         this.#captionsBaselineReady = false;
 
-        // Right at a video transition is the least reliable moment to
-        // query the player — it can still be reflecting the previous
-        // video's state. Wait the same delay already proven reliable
-        // for the auto-apply schedule before establishing the real
-        // baseline; until then, transition detection is simply held
-        // off (see the resolveCommand patch below).
         if (this.#captionsBaselineTimerId !== null) {
             clearTimeout(this.#captionsBaselineTimerId);
         }
@@ -726,31 +560,11 @@ class SubtitlePersistenceHandler {
                         const videoId = self.#getVideoId();
 
                         if (videoId) {
-                            // Unchanged from the original design:
-                            // respect this for the rest of THIS video,
-                            // don't let the pending auto-apply timer
-                            // fight it. Whether this "off" came from a
-                            // real click here or from YouTube TV
-                            // carrying over the previous video's state
-                            // isn't something we try to tell apart —
-                            // that carrying-over is native behavior,
-                            // not ours to manage.
+
                             self.#overriddenVideoId = videoId;
                             self.#scheduledVideoId = null;
                             self.#clearTimers();
 
-                            // Independently: if this specific command
-                            // just turned captions on after they were
-                            // off, apply the saved translation language
-                            // on top of it. Whether that's a fresh
-                            // click on this same video, or the user
-                            // finally reopening captions on a video
-                            // whose closed state carried over from the
-                            // last one, is irrelevant — only the
-                            // transition itself matters. Skip this
-                            // entirely until the baseline for this
-                            // video is established — same timing the
-                            // auto-apply schedule already relies on.
                             if (self.#captionsBaselineReady) {
                                 self.#correctOnClosedToOpenTransition(
                                     videoId,
