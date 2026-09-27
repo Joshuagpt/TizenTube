@@ -469,8 +469,30 @@ class SubtitlePersistenceHandler {
                 return;
             }
 
+            debugLog('schedule: applying preferred language now');
             applyPreferredLanguage();
-            this.#captionsWereOn = true;
+
+            // Verify rather than assume: this fires at the exact same
+            // volatile just-after-video-start timing that's caused
+            // trouble elsewhere, so the command itself can silently
+            // fail to take effect here too. Blindly marking this true
+            // regardless of success previously poisoned later
+            // transition detection — a real closed → open action
+            // afterward would see a false "was already on" and skip
+            // correcting it. Only record what's actually true.
+            setTimeout(() => {
+                if (this.#getVideoId() !== videoId) {
+                    return;
+                }
+
+                const succeeded = this.#areCaptionsCurrentlyOn();
+
+                debugLog(
+                    'schedule: post-apply check succeeded=' + succeeded
+                );
+
+                this.#captionsWereOn = succeeded;
+            }, CAPTIONS_SETTLE_DELAY_MS);
         }, AUTO_APPLY_DELAY_MS);
 
         this.#timers.push(timerId);
