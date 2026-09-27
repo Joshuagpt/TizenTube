@@ -40,6 +40,50 @@ const AUTO_APPLY_DELAY_MS = 3000;
 
 let isInternalApply = false;
 
+// TEMPORARY DEBUG HELPER — shows log lines in the top-left corner of the
+// screen, for testing on a TV with no console access. Safe to delete
+// once the getOption() investigation is done; it doesn't affect any
+// other behavior.
+function debugLog(message) {
+    try {
+        let el = document.getElementById(
+            'subtitle-persistence-debug-overlay'
+        );
+
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'subtitle-persistence-debug-overlay';
+            el.style.cssText = [
+                'position:fixed',
+                'top:0',
+                'left:0',
+                'z-index:999999',
+                'background:rgba(0,0,0,0.85)',
+                'color:#0f0',
+                'font-size:22px',
+                'font-family:monospace',
+                'padding:10px',
+                'max-width:92vw',
+                'max-height:60vh',
+                'overflow:hidden',
+                'white-space:pre-wrap',
+                'pointer-events:none',
+            ].join(';');
+            document.documentElement.appendChild(el);
+        }
+
+        const time = new Date().toTimeString().slice(0, 8);
+        const lines = [`[${time}] ${message}`, el.textContent]
+            .join('\n')
+            .split('\n')
+            .slice(0, 16);
+
+        el.textContent = lines.join('\n');
+    } catch (e) {
+        // Debug overlay itself must never throw.
+    }
+}
+
 function getCurrentPlayer() {
     try {
         return document.querySelector(SELECTORS.PLAYER);
@@ -283,8 +327,11 @@ class SubtitlePersistenceHandler {
                 'track'
             );
 
+            debugLog('getOption track: ' + JSON.stringify(track));
+
             return !!(track && track.languageCode);
         } catch (e) {
+            debugLog('getOption threw: ' + e);
             return false;
         }
     }
@@ -304,10 +351,16 @@ class SubtitlePersistenceHandler {
 
         const isOnNow = this.#areCaptionsCurrentlyOn();
 
+        debugLog(
+            `correct check attempt=${attempt} wasOn=${wasOn} isOnNow=${isOnNow}`
+        );
+
         if (isOnNow) {
             this.#captionsWereOn = true;
 
             if (!wasOn) {
+                debugLog('transition detected -> will apply translation');
+
                 // Defer the actual correction rather than calling
                 // applyPreferredLanguage() here directly: this runs
                 // synchronously inside the resolveCommand call that
@@ -323,8 +376,31 @@ class SubtitlePersistenceHandler {
                         return;
                     }
 
+                    debugLog('applyPreferredLanguage() firing now');
                     applyPreferredLanguage();
+
+                    // Verification only — does not affect behavior.
+                    // Checks whether the corrective command actually
+                    // took effect, or was silently dropped/ignored by
+                    // the player.
+                    setTimeout(() => {
+                        if (this.#getVideoId() !== videoId) {
+                            return;
+                        }
+
+                        const track = this.#player?.getOption?.(
+                            'captions',
+                            'track'
+                        );
+
+                        debugLog(
+                            'post-apply check track: ' +
+                                JSON.stringify(track)
+                        );
+                    }, CAPTIONS_SETTLE_DELAY_MS);
                 }, CAPTIONS_SETTLE_DELAY_MS);
+            } else {
+                debugLog('already on before -> no correction');
             }
 
             return;
@@ -628,44 +704,37 @@ class SubtitlePersistenceHandler {
                         const videoId = self.#getVideoId();
 
                         if (videoId) {
-                            // Only treat a non-translation command as a
-                            // genuine user override AFTER the baseline
-                            // for this video has been established
-                            // (~AUTO_APPLY_DELAY_MS after video start).
-                            // Non-translation commands that arrive
-                            // earlier are treated as YouTube TV's own
-                            // automatic track selection on video load
-                            // (native state carry-over), and are
-                            // deliberately ignored so the pending
-                            // auto-apply timer can still force the
-                            // remembered translation language.
-                            if (self.#captionsBaselineReady) {
-                                // User manually selected a non-translated
-                                // track or turned captions off while
-                                // watching this video — respect that for
-                                // the rest of THIS video only.
-                                self.#overriddenVideoId = videoId;
-                                self.#scheduledVideoId = null;
-                                self.#clearTimers();
+                            // Unchanged from the original design:
+                            // respect this for the rest of THIS video,
+                            // don't let the pending auto-apply timer
+                            // fight it. Whether this "off" came from a
+                            // real click here or from YouTube TV
+                            // carrying over the previous video's state
+                            // isn't something we try to tell apart —
+                            // that carrying-over is native behavior,
+                            // not ours to manage.
+                            self.#overriddenVideoId = videoId;
+                            self.#scheduledVideoId = null;
+                            self.#clearTimers();
 
-                                // Independently: if this specific command
-                                // just turned captions on after they were
-                                // off, apply the saved translation language
-                                // on top of it. Whether that's a fresh
-                                // click on this same video, or the user
-                                // finally reopening captions on a video
-                                // whose closed state carried over from the
-                                // last one, is irrelevant — only the
-                                // transition itself matters.
+                            // Independently: if this specific command
+                            // just turned captions on after they were
+                            // off, apply the saved translation language
+                            // on top of it. Whether that's a fresh
+                            // click on this same video, or the user
+                            // finally reopening captions on a video
+                            // whose closed state carried over from the
+                            // last one, is irrelevant — only the
+                            // transition itself matters. Skip this
+                            // entirely until the baseline for this
+                            // video is established — same timing the
+                            // auto-apply schedule already relies on.
+                            if (self.#captionsBaselineReady) {
                                 self.#correctOnClosedToOpenTransition(
                                     videoId,
                                     self.#captionsWereOn
                                 );
                             }
-                            // else: baseline not ready yet → ignore this
-                            // non-translation command (system auto-select).
-                            // Do NOT set #overriddenVideoId and do NOT
-                            // clear the auto-apply timers.
                         }
                     }
                 }
